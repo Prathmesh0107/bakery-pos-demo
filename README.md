@@ -1,34 +1,40 @@
-# Rush Counter POS — concept demo (FastAPI + PostgreSQL)
+# Rush Counter POS — tablet-first concept demo (FastAPI + PostgreSQL)
 
-Independent concept demo. **Not an official Monginis product**; no Monginis approval implied.
-Prices, stock and sales are sample data. UPI/Card only *record* the chosen method; no real payment is processed.
+> **Phase 0 safety patch applied** — login required, demo tools removed from production, fail-closed config. Read **docs/PHASE0.md** before deploying: new required environment variables, risks and rollback. Not production-ready until the verification checklist there is complete.
+
+Independent concept demo. **Not an official Monginis product**; not connected to, authorised by, or integrated with any franchise billing software.
+Prices, stock and sales are sample data. Cash/UPI only *record* the method chosen; no real payment is processed.
+
+## Screens (built for a 10–11" Android tablet, landscape, ~1280×800 / 1024×768)
+- **Counter** — category rail (from your data) · large product tiles · sticky bill. One tap adds a unit; CASH / UPI complete the sale in one tap; SPLIT takes Cash + UPI amounts and only completes when they equal the total. After a sale the bill clears and you are straight back on the tiles.
+- **Stock** — big quantity per product, one-tap +5 / +10 / +20, "Other…" (add, remove or set exact count), edit/hide product, low/out filter, and a log of recent stock changes (sales, restocks, corrections).
+- **Sales** — day summary (split bills counted by part), bills list with **Reprint** (never changes stock).
+- **Printer** — shop name, address, phone, GST/tax no., footer, 58/80 mm paper, text size, auto-open print after sale, demo-note line, live preview, Test print. Saved in the database, shared by every device.
 
 ## Deploy on Render
-1. Push this folder to a GitHub repo.
-2. Render dashboard -> **New -> Blueprint** -> pick the repo. `render.yaml` creates the web service and the Postgres database and wires `DATABASE_URL` automatically.
-3. Open the service URL once it is live. Tables and sample products are created on first start.
-4. Optional device viewer (phone/tablet frames for a laptop demo): add `?viewer=1` to the URL.
+1. Push this folder to GitHub → Render **New → Blueprint**. `render.yaml` creates the web service + Postgres and wires `DATABASE_URL`.
+2. Existing data is kept: startup only adds missing tables/columns (`stock_log`, `settings`, `sales.payments`, `products.image`). Nothing is dropped or reset.
+3. Set the required variables listed in `.env.example` (`SESSION_SECRET`, `OWNER_PASSWORD_HASH`, …). The app will not start without them. `OWNER_PIN` no longer exists.
+4. Device viewer for a laptop demo: add `?viewer=1`.
 
-Free-tier notes (check Render's current terms): free web services sleep when idle (first load can take ~30-60 s, so open it before the demo), and free Postgres databases may expire after a limited period. Use a paid plan for anything long-lived.
+Free-tier notes (check Render's current terms): free web services sleep when idle (open it before the demo) and free Postgres may expire.
 
 ## Run locally
 ```
 docker run -d --name rushdb -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=rushpos -p 5432:5432 postgres:16
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-export DATABASE_URL=postgresql://postgres:postgres@localhost:5432/rushpos
+python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+cp .env.example .env   # fill it in (APP_MODE=demo + COOKIE_SECURE=false for local http)
+set -a; source .env; set +a
 uvicorn app.main:app --reload
 ```
-Open http://localhost:8000
 
-## What the database does
-- `products`, `sales` tables plus a `bill_seq` sequence for sequential bill numbers (DEMO-1001, ...).
-- Completing a sale runs in one transaction: rows are locked, stock/availability are checked, stock is deducted, the bill is saved. Drafts never touch stock.
-- Each checkout sends an idempotency key, so a double-click or retry returns the same bill instead of a duplicate.
-- Data is shared by every device using the URL. Refresh another device to see new sales/stock.
-- **Reset Demo Data** (page footer) truncates the two tables and re-seeds them.
+## How stock stays correct
+- An open bill never touches stock. Completing a sale runs in **one transaction**: product rows are locked, stock is checked, stock is deducted, the bill and stock-log rows are saved.
+- Each checkout carries an idempotency key, so double taps / retries return the same bill and never deduct twice. Reprints are client-side only.
+- Stock can never go below 0 (database CHECK + server validation). Tiles refresh every 20 s so a second device stays in step.
+
+## Printing
+Uses the browser print dialog (works with any printer the tablet can print to, incl. a paired 58 mm Bluetooth thermal printer). Page size follows the paper-width setting. Browsers cannot print silently; direct ESC/POS over Bluetooth would be a separate add-on.
 
 ## API
-`GET /api/state` · `POST /api/products` · `PUT /api/products/{id}` · `POST /api/sales` · `POST /api/reset` · `GET /healthz`
-
-Layout: `app/main.py` (API), `static/index.html` (UI), `render.yaml`, `requirements.txt`.
+All `/api/*` routes except `/api/session`, `/api/login`, `/api/logout` need a login. Owner only: products, stock, stock-log, printer. Counter staff: `GET /api/state` (recent bills only), `POST /api/sales`. `POST /api/reset` and `/api/restore-products` exist only with `APP_MODE=demo`. `GET /healthz`.

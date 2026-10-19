@@ -1,0 +1,280 @@
+From e3f78b5c4efe49ddb7ea2c290fc095243aefb87f Mon Sep 17 00:00:00 2001
+From: Phase0 <dev@local>
+Date: Mon, 19 Oct 2026 19:23:06 +0000
+Subject: [PATCH 1/9] P0-5: fail closed on missing/insecure config (no
+ localhost fallback); add auth primitives (unused yet)
+
+---
+ app/auth.py              | 110 +++++++++++++++++++++++++++++++++++++++
+ app/config.py            |  82 +++++++++++++++++++++++++++++
+ app/main.py              |  11 ++--
+ scripts/hash_password.py |  15 ++++++
+ 4 files changed, 215 insertions(+), 3 deletions(-)
+ create mode 100644 app/auth.py
+ create mode 100644 app/config.py
+ create mode 100644 scripts/hash_password.py
+
+diff --git a/app/auth.py b/app/auth.py
+new file mode 100644
+index 0000000..6004fb5
+--- /dev/null
++++ b/app/auth.py
+@@ -0,0 +1,110 @@
++"""Authentication primitives (stdlib only, no database tables needed).
++
++Phase 0 model: two role accounts (owner, staff), password hashes supplied by environment variables,
++stateless HMAC-signed session cookie. See docs/PHASE0.md for the trade-offs.
++"""
++import base64
++import hashlib
++import hmac
++import json
++import secrets
++import time
++from typing import Dict, List, Optional
++
++SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 14, 8, 1
++COOKIE = "rpos_session"
++ROLES = ("owner", "staff")
++
++
++# ---------- password hashing ----------
++def hash_password(pw: str, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P) -> str:
++    salt = secrets.token_bytes(16)
++    dk = hashlib.scrypt(pw.encode(), salt=salt, n=n, r=r, p=p, dklen=32)
++    return f"scrypt${n}${r}${p}${salt.hex()}${dk.hex()}"
++
++
++def verify_password(pw: str, stored: Optional[str]) -> bool:
++    """Constant-time. Always burns one scrypt so a missing account is not distinguishable by timing."""
++    try:
++        _, n, r, p, salt, want = (stored or "").split("$")
++        salt_b, want_b = bytes.fromhex(salt), bytes.fromhex(want)
++        n, r, p = int(n), int(r), int(p)
++        if n > 2 ** 20 or r > 32 or p > 4:  # refuse absurd cost parameters from a malformed value
++            raise ValueError
++    except Exception:
++        hashlib.scrypt(pw.encode(), salt=b"x" * 16, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, dklen=32)
++        return False
++    got = hashlib.scrypt(pw.encode(), salt=salt_b, n=n, r=r, p=p, dklen=len(want_b), maxmem=256 * 1024 * 1024)
++    return hmac.compare_digest(got, want_b)
++
++
++# ---------- signed session cookie ----------
++def _b64(b: bytes) -> str:
++    return base64.urlsafe_b64encode(b).decode().rstrip("=")
++
++
++def _unb64(s: str) -> bytes:
++    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
++
++
++def _sig(secret: str, msg: str) -> str:
++    return _b64(hmac.new(secret.encode(), msg.encode(), hashlib.sha256).digest())
++
++
++def make_session(secret: str, role: str, hours: int, now: Optional[float] = None) -> str:
++    now = time.time() if now is None else now
++    body = _b64(json.dumps({"r": role, "e": int(now + hours * 3600), "i": secrets.token_hex(8)},
++                           separators=(",", ":")).encode())
++    return body + "." + _sig(secret, body)
++
++
++def read_session(secret: str, token: Optional[str], now: Optional[float] = None) -> Optional[dict]:
++    """Returns {"role","sid","csrf"} or None for anything missing, tampered, malformed or expired."""
++    if not token or token.count(".") != 1:
++        return None
++    body, sig = token.split(".")
++    if not hmac.compare_digest(sig, _sig(secret, body)):
++        return None
++    try:
++        d = json.loads(_unb64(body))
++        role, exp, sid = d["r"], int(d["e"]), str(d["i"])
++    except Exception:
++        return None
++    if role not in ROLES or (time.time() if now is None else now) >= exp:
++        return None
++    return {"role": role, "sid": sid, "csrf": csrf_for(secret, sid)}
++
++
++def csrf_for(secret: str, sid: str) -> str:
++    return _sig(secret, "csrf:" + sid)
++
++
++# ---------- login throttle (in memory, per role) ----------
++class Throttle:
++    """After MAX failures inside WINDOW seconds a role is locked for LOCK seconds.
++
++    In-memory: resets on restart and is per process (fine for one instance; see docs/PHASE0.md).
++    Keyed by role, not IP, because behind Render's proxy every client shares one address. Trade-off:
++    someone guessing wrong passwords can lock the login for LOCK seconds (a nuisance, not a breach).
++    """
++
++    def __init__(self, max_fail=8, window=600, lock=300):
++        self.max_fail, self.window, self.lock = max_fail, window, lock
++        self.fails: Dict[str, List[float]] = {}
++        self.locked_until: Dict[str, float] = {}
++
++    def retry_after(self, key: str, now: Optional[float] = None) -> int:
++        now = time.time() if now is None else now
++        left = self.locked_until.get(key, 0) - now
++        return int(left) + 1 if left > 0 else 0
++
++    def failure(self, key: str, now: Optional[float] = None) -> None:
++        now = time.time() if now is None else now
++        f = [t for t in self.fails.get(key, []) if now - t < self.window] + [now]
++        self.fails[key] = f
++        if len(f) >= self.max_fail:
++            self.locked_until[key] = now + self.lock
++            self.fails[key] = []
++
++    def success(self, key: str) -> None:
++        self.fails.pop(key, None)
+diff --git a/app/config.py b/app/config.py
+new file mode 100644
+index 0000000..32a0990
+--- /dev/null
++++ b/app/config.py
+@@ -0,0 +1,82 @@
++"""Startup configuration. Fails CLOSED: missing or insecure settings stop the app from starting.
++
++No default database URL, no default secrets, no "open" mode. Pure stdlib so it can be unit-tested anywhere.
++"""
++from dataclasses import dataclass
++from typing import Mapping, Optional
++
++MODES = ("production", "demo")
++
++
++class ConfigError(RuntimeError):
++    pass
++
++
++@dataclass(frozen=True)
++class Settings:
++    mode: str                 # "production" (default) or "demo"
++    database_url: str
++    session_secret: str
++    owner_hash: str
++    staff_hash: Optional[str]  # None = counter-staff login disabled
++    cookie_secure: bool
++    session_hours: int
++
++    @property
++    def is_demo(self) -> bool:
++        return self.mode == "demo"
++
++
++def _looks_like_hash(v: str) -> bool:
++    p = v.split("$")
++    return len(p) == 6 and p[0] == "scrypt" and all(p[1:4]) and p[1].isdigit() and p[2].isdigit() and p[3].isdigit()
++
++
++def load_settings(env: Mapping[str, str]) -> Settings:
++    g = lambda k: (env.get(k) or "").strip()
++    errs = []
++
++    # An unset APP_MODE is production on purpose: the safe mode is the default.
++    mode = g("APP_MODE").lower() or "production"
++    if mode not in MODES:
++        errs.append(f"APP_MODE must be one of {MODES} (got {mode!r})")
++
++    db = g("DATABASE_URL")
++    if not db:
++        errs.append("DATABASE_URL is required (there is no localhost fallback)")
++    elif not db.startswith(("postgresql://", "postgres://")):
++        errs.append("DATABASE_URL must start with postgresql://")
++
++    secret = g("SESSION_SECRET")
++    if len(secret) < 32:
++        errs.append("SESSION_SECRET is required and must be at least 32 characters "
++                    "(generate with: python -c \"import secrets;print(secrets.token_urlsafe(48))\")")
++
++    owner = g("OWNER_PASSWORD_HASH")
++    if not _looks_like_hash(owner):
++        errs.append("OWNER_PASSWORD_HASH is required (generate with: python scripts/hash_password.py)")
++
++    staff = g("STAFF_PASSWORD_HASH") or None
++    if staff and not _looks_like_hash(staff):
++        errs.append("STAFF_PASSWORD_HASH is set but is not a valid hash (python scripts/hash_password.py)")
++    if staff and staff == owner:
++        errs.append("STAFF_PASSWORD_HASH must differ from OWNER_PASSWORD_HASH")
++
++    cs = g("COOKIE_SECURE").lower() or "true"
++    if cs not in ("true", "false"):
++        errs.append("COOKIE_SECURE must be true or false")
++    cookie_secure = cs != "false"
++    if not cookie_secure and mode != "demo":
++        errs.append("COOKIE_SECURE=false is only allowed with APP_MODE=demo (local http testing)")
++
++    try:
++        hours = int(g("SESSION_HOURS") or "12")
++        if not 1 <= hours <= 24:
++            raise ValueError
++    except ValueError:
++        errs.append("SESSION_HOURS must be a whole number from 1 to 24")
++        hours = 12
++
++    if errs:
++        raise ConfigError("Refusing to start - fix these settings:\n  - " + "\n  - ".join(errs))
++    return Settings(mode, db, secret, owner, staff, cookie_secure, hours)
+diff --git a/app/main.py b/app/main.py
+index a9d34aa..03e15ac 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -17,8 +17,9 @@ from fastapi.responses import FileResponse
+ from fastapi.staticfiles import StaticFiles
+ from pydantic import BaseModel, Field, field_validator
+ 
+-DB_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/rushpos")
+-OWNER_PIN = os.environ.get("OWNER_PIN", "").strip()  # optional: protects Stock, Printer settings and Reset
++from .config import ConfigError, Settings, load_settings
++
++CFG: Optional[Settings] = None  # set in lifespan from validated environment; there is no default database URL
+ STATIC = Path(__file__).resolve().parent.parent / "static"
+ CATS = ["Cakes", "Pastries", "Puffs & Savouries", "Bread & Bakery", "Cookies & Chocolates", "Candles & Birthday Accessories"]
+ 
+@@ -79,7 +80,9 @@ PRINTER_DEFAULTS = {
+ 
+ 
+ def db():
+-    return psycopg.connect(DB_URL, row_factory=dict_row)
++    if CFG is None:
++        raise RuntimeError("Settings not loaded")
++    return psycopg.connect(CFG.database_url, row_factory=dict_row, connect_timeout=5)
+ 
+ 
+ def seed(c):
+@@ -101,6 +104,8 @@ def add_missing_samples(c):
+ 
+ @asynccontextmanager
+ async def lifespan(_):
++    global CFG
++    CFG = load_settings(os.environ)  # raises ConfigError -> process exits before serving anything
+     with db() as c:
+         c.execute(SCHEMA)
+         if c.execute("SELECT count(*) AS n FROM products").fetchone()["n"] == 0:
+diff --git a/scripts/hash_password.py b/scripts/hash_password.py
+new file mode 100644
+index 0000000..5d95942
+--- /dev/null
++++ b/scripts/hash_password.py
+@@ -0,0 +1,15 @@
++#!/usr/bin/env python3
++"""Generate a password hash for OWNER_PASSWORD_HASH / STAFF_PASSWORD_HASH. Run locally; never commit the password."""
++import getpass
++import os
++import sys
++
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
++from app.auth import hash_password  # noqa: E402
++
++pw = getpass.getpass("Password (min 10 characters): ")
++if len(pw) < 10:
++    sys.exit("Too short - use at least 10 characters.")
++if pw != getpass.getpass("Repeat password: "):
++    sys.exit("Passwords did not match.")
++print(hash_password(pw))
+-- 
+2.43.0
+

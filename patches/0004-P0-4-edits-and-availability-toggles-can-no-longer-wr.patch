@@ -1,0 +1,118 @@
+From 413d893878221f651efc1f4a449e6c337e53b395 Mon Sep 17 00:00:00 2001
+From: Phase0 <dev@local>
+Date: Mon, 19 Oct 2026 19:24:29 +0000
+Subject: [PATCH 4/9] P0-4: edits and availability toggles can no longer write
+ stock; set-to count is guarded by the value the person saw
+
+---
+ app/main.py       | 34 ++++++++++++++++++++++++++++------
+ static/index.html | 12 ++++++------
+ 2 files changed, 34 insertions(+), 12 deletions(-)
+
+diff --git a/app/main.py b/app/main.py
+index 4599785..fc2ea25 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -234,11 +234,12 @@ def logout(response: Response):
+     return {"ok": True}
+ 
+ 
+-class ProductIn(BaseModel):
++class ProductEdit(BaseModel):
++    """Fields an edit may change. Stock is deliberately NOT here: stock only changes through /stock (delta, logged)
++    or a sale, so a stale browser copy can never overwrite it. Unknown fields (e.g. an old client's `stock`) are ignored."""
+     name: str = Field(min_length=1, max_length=120)
+     cat: str = Field(min_length=1, max_length=60)
+     price: int = Field(ge=0, le=1_000_000)
+-    stock: int = Field(ge=0, le=1_000_000)
+     on: bool = True
+     image: Optional[str] = Field(default=None, max_length=500)
+ 
+@@ -253,6 +254,14 @@ class ProductIn(BaseModel):
+         return v
+ 
+ 
++class ProductIn(ProductEdit):
++    stock: int = Field(ge=0, le=1_000_000)  # opening stock, only when CREATING a product
++
++
++class AvailabilityIn(BaseModel):
++    on: bool
++
++
+ class Line(BaseModel):
+     id: int
+     q: int = Field(ge=1, le=999)
+@@ -270,6 +279,7 @@ class SaleIn(BaseModel):
+ class StockIn(BaseModel):
+     add: Optional[int] = Field(default=None, ge=-1_000_000, le=1_000_000)
+     set_to: Optional[int] = Field(default=None, ge=0, le=1_000_000)
++    expected: Optional[int] = Field(default=None, ge=0, le=1_000_000)  # stock the person saw when counting (set_to only)
+     note: Optional[str] = Field(default=None, max_length=60)
+ 
+ 
+@@ -337,14 +347,23 @@ def add_product(p: ProductIn):
+ 
+ 
+ @app.put("/api/products/{pid}", dependencies=[OWNER])
+-def edit_product(pid: int, p: ProductIn):
++def edit_product(pid: int, p: ProductEdit):
+     with db() as c:
+         old = c.execute("SELECT * FROM products WHERE id=%s FOR UPDATE", (pid,)).fetchone()
+         if not old:
+             raise HTTPException(404, "Product not found")
+-        r = c.execute("UPDATE products SET name=%s,category=%s,price=%s,stock=%s,available=%s,image=%s WHERE id=%s RETURNING *",
+-                      (p.name.strip(), p.cat.strip(), p.price, p.stock, p.on, p.image, pid)).fetchone()
+-        log_stock(c, pid, r["name"], old["stock"], r["stock"], "correction", "edit")
++        r = c.execute("UPDATE products SET name=%s,category=%s,price=%s,available=%s,image=%s WHERE id=%s RETURNING *",
++                      (p.name.strip(), p.cat.strip(), p.price, p.on, p.image, pid)).fetchone()
++    return prod_out(r)
++
++
++@app.patch("/api/products/{pid}/availability", dependencies=[OWNER])
++def set_availability(pid: int, b: AvailabilityIn):
++    """Sold-out / available toggle. Touches ONLY `available`; sends an explicit target state so a repeat is harmless."""
++    with db() as c:
++        r = c.execute("UPDATE products SET available=%s WHERE id=%s RETURNING *", (b.on, pid)).fetchone()
++        if not r:
++            raise HTTPException(404, "Product not found")
+     return prod_out(r)
+ 
+ 
+@@ -357,6 +376,9 @@ def adjust_stock(pid: int, b: StockIn):
+         r = c.execute("SELECT * FROM products WHERE id=%s FOR UPDATE", (pid,)).fetchone()
+         if not r:
+             raise HTTPException(404, "Product not found")
++        if b.set_to is not None and b.expected is not None and b.expected != r["stock"]:
++            raise HTTPException(409, f"Stock changed while you were counting: it is now {r['stock']}, not {b.expected}. "
++                                     "Please recount.")
+         new = r["stock"] + b.add if b.add is not None else b.set_to
+         if new < 0:
+             raise HTTPException(409, f"Only {r['stock']} in stock - cannot remove {-b.add}")
+diff --git a/static/index.html b/static/index.html
+index bc11803..d990c8b 100644
+--- a/static/index.html
++++ b/static/index.html
+@@ -192,13 +192,13 @@ function invR(){const s=iq.toLowerCase(),l=S.products.filter(p=>(ic=='All'||p.ca
+ $('iq').oninput=e=>{iq=e.target.value;const p=e.target.selectionStart;invR();$('iq').focus();$('iq').setSelectionRange(p,p)};$('lo').onclick=()=>{lowOnly=!lowOnly;invR()};
+ for(const b of document.querySelectorAll('.chips button'))b.onclick=()=>{ic=b.dataset.c;invR()};
+ $('rows').onclick=e=>{const b=e.target.closest('button');if(!b)return;const id=+b.closest('.sr').dataset.id,a=b.dataset.a;if(a=='e')edit(id);else if(a=='o')stockM(id);else if(a=='t')tog(id);else adj(id,{add:+a})};loadLog()}
+-async function adj(id,body){try{const p=await api('/products/'+id+'/stock',{method:'POST',body:JSON.stringify(body)});Object.assign(P(id),p);if(view=='inv'){const r=document.querySelector(`.sr[data-id="${id}"]`);if(r)r.outerHTML=rowH(P(id));loadLog()}closeM();fixCart();toast(p.name+' → '+p.stock+' in stock');return true}catch(e){toast(e.message,1);return false}}
++async function adj(id,body){try{const p=await api('/products/'+id+'/stock',{method:'POST',body:JSON.stringify(body)});Object.assign(P(id),p);if(view=='inv'){const r=document.querySelector(`.sr[data-id="${id}"]`);if(r)r.outerHTML=rowH(P(id));loadLog()}closeM();fixCart();toast(p.name+' → '+p.stock+' in stock');return true}catch(e){toast(e.message,1);if(e.status==409){closeM();await load();if(view=='inv')invR()}return false}}
+ function stockM(id){const p=P(id);modal(`<h2>${esc(p.name)}</h2><p class="mu">In stock now: <b>${p.stock}</b></p><label>Quantity</label><input id="sq" inputmode="numeric" autocomplete="off"><label>Note (optional)</label><input id="sn" maxlength="60" placeholder="e.g. fresh batch, counted, damaged"><div class="row" style="margin-top:12px"><button class="pri" style="flex:1;background:var(--ok);border-color:var(--ok)" id="s1">+ Add</button><button style="flex:1" id="s2">− Remove</button><button style="flex:1" id="s3">Set to</button></div><button style="width:100%;margin-top:10px" onclick="closeM()">Cancel</button>`);$('sq').oninput=e=>e.target.value=e.target.value.replace(/\D/g,'');const g=()=>{const v=$('sq').value;if(v==='')return null;return Number(v)};const n=()=>$('sn').value.trim()||undefined;
+-$('s1').onclick=()=>{const v=g();v!=null&&adj(id,{add:v,note:n()})};$('s2').onclick=()=>{const v=g();v!=null&&adj(id,{add:-v,note:n()})};$('s3').onclick=()=>{const v=g();v!=null&&adj(id,{set_to:v,note:n()||'manual count'})};setTimeout(()=>$('sq').focus(),50)}
+-async function tog(id){const p=P(id);try{await api('/products/'+id,{method:'PUT',body:JSON.stringify({name:p.name,cat:p.cat,price:p.price,stock:p.stock,on:!p.on,image:p.image||null})});await load();fixCart();invR();toast(p.name+(p.on?' hidden':' available'))}catch(e){toast(e.message,1)}}
+-function edit(id){const p=id?P(id):{name:'',cat:S.categories[0]||'',price:'',stock:'',on:true,image:''};modal(`<h2 style="margin:0 0 6px">${id?'Edit':'New'} product</h2><label>Name</label><input id="en" value="${esc(p.name)}"><label>Category (pick or type a new one)</label><input id="ec" list="cl" value="${esc(p.cat)}"><datalist id="cl">${S.categories.map(c=>`<option value="${esc(c)}">`).join('')}</datalist><label>Price (₹)</label><input id="ep" inputmode="numeric" value="${p.price}"><label>${id?'Stock (use +5 / Other… for normal restocking)':'Opening stock'}</label><input id="es" inputmode="numeric" value="${p.stock}"><label>Image link (optional)</label><input id="ei" value="${esc(p.image||'')}" placeholder="https://… or /static/…"><label style="display:flex;gap:8px;align-items:center;color:var(--tx)"><input type="checkbox" id="eo" style="width:26px;min-height:26px" ${p.on?'checked':''}> Available for sale</label><p id="er" class="bad"></p><div class="row"><button style="flex:1" onclick="closeM()">Cancel</button><button class="pri" style="flex:1" onclick="saveP(${id})">Save</button></div>`)}
+-async function saveP(id){const n=$('en').value.trim(),c=$('ec').value.trim(),pr=Number($('ep').value),st=Number($('es').value),e=$('er');if(!n)return e.textContent='Enter a product name.';if(!c)return e.textContent='Enter a category.';if($('ep').value.trim()===''||!Number.isInteger(pr)||pr<0)return e.textContent='Price must be a whole number of rupees.';if($('es').value.trim()===''||!Number.isInteger(st)||st<0)return e.textContent='Stock must be a whole number, 0 or more.';
+-try{await api(id?'/products/'+id:'/products',{method:id?'PUT':'POST',body:JSON.stringify({name:n,cat:c,price:pr,stock:st,on:$('eo').checked,image:$('ei').value.trim()||null})});await load();fixCart();closeM();invR();top_();toast('Product saved')}catch(x){e.textContent=x.message}}
++$('s1').onclick=()=>{const v=g();v!=null&&adj(id,{add:v,note:n()})};$('s2').onclick=()=>{const v=g();v!=null&&adj(id,{add:-v,note:n()})};$('s3').onclick=()=>{const v=g();v!=null&&adj(id,{set_to:v,expected:p.stock,note:n()||'manual count'})};setTimeout(()=>$('sq').focus(),50)}
++async function tog(id){const p=P(id);try{await api('/products/'+id+'/availability',{method:'PATCH',body:JSON.stringify({on:!p.on})});await load();fixCart();invR();toast(p.name+(p.on?' hidden':' available'))}catch(e){toast(e.message,1)}}
++function edit(id){const p=id?P(id):{name:'',cat:S.categories[0]||'',price:'',stock:'',on:true,image:''};modal(`<h2 style="margin:0 0 6px">${id?'Edit':'New'} product</h2><label>Name</label><input id="en" value="${esc(p.name)}"><label>Category (pick or type a new one)</label><input id="ec" list="cl" value="${esc(p.cat)}"><datalist id="cl">${S.categories.map(c=>`<option value="${esc(c)}">`).join('')}</datalist><label>Price (₹)</label><input id="ep" inputmode="numeric" value="${p.price}">${id?`<p class="mu">Stock now: <b>${p.stock}</b>. Change stock with +5 / Other… on the Stock screen so every change is logged.</p>`:`<label>Opening stock</label><input id="es" inputmode="numeric" value="${p.stock}">`}<label>Image link (optional)</label><input id="ei" value="${esc(p.image||'')}" placeholder="https://… or /static/…"><label style="display:flex;gap:8px;align-items:center;color:var(--tx)"><input type="checkbox" id="eo" style="width:26px;min-height:26px" ${p.on?'checked':''}> Available for sale</label><p id="er" class="bad"></p><div class="row"><button style="flex:1" onclick="closeM()">Cancel</button><button class="pri" style="flex:1" onclick="saveP(${id})">Save</button></div>`)}
++async function saveP(id){const n=$('en').value.trim(),c=$('ec').value.trim(),pr=Number($('ep').value),st=$('es')?Number($('es').value):0,e=$('er');if(!n)return e.textContent='Enter a product name.';if(!c)return e.textContent='Enter a category.';if($('ep').value.trim()===''||!Number.isInteger(pr)||pr<0)return e.textContent='Price must be a whole number of rupees.';if($('es')&&($('es').value.trim()===''||!Number.isInteger(st)||st<0))return e.textContent='Stock must be a whole number, 0 or more.';
++try{await api(id?'/products/'+id:'/products',{method:id?'PUT':'POST',body:JSON.stringify({name:n,cat:c,price:pr,...(id?{}:{stock:st}),on:$('eo').checked,image:$('ei').value.trim()||null})});await load();fixCart();closeM();invR();top_();toast('Product saved')}catch(x){e.textContent=x.message}}
+ /* ---------- sales ---------- */
+ function salesR(){const d=dsel||dk(Date.now()),s=S.sales.filter(x=>dk(x.t)==d),t=s.reduce((a,x)=>a+x.total,0),pm={Cash:0,UPI:0,Card:0},tp={};s.forEach(x=>{Object.entries(x.payments||{[x.pay]:x.total}).forEach(([k,v])=>pm[k]=(pm[k]||0)+v);x.items.forEach(i=>tp[i.name]=(tp[i.name]||0)+i.q)});const top=Object.entries(tp).sort((a,b)=>b[1]-a[1]).slice(0,5);
+ $('v').innerHTML=`<div class="pg"><div class="panel row wrap"><b>Demo sales records — sample data, not real business figures</b><input type="date" id="ds" value="${d}" style="width:auto"></div><div class="kp"><div>Total sales<b>${M(t)}</b></div><div>Completed bills<b>${s.length}</b></div><div>Average bill<b>${M(s.length?Math.round(t/s.length):0)}</b></div></div><div class="sg" style="grid-template-columns:1fr 1fr"><div class="panel"><h3>Payment methods (split bills counted by part)</h3>${Object.entries(pm).filter(e=>e[1]||e[0]!='Card').map(e=>`<div class="row" style="padding:4px 0"><span>${e[0]}</span><b>${M(e[1])}</b></div>`).join('')}</div><div class="panel"><h3>Most sold</h3>${top.map(e=>`<div class="row" style="padding:4px 0"><span>${esc(e[0])}</span><b>${e[1]}</b></div>`).join('')||'<p class="mu">No sales on this date yet.</p>'}</div></div><div class="panel"><h3>Bills (tap Reprint — stock is never changed by a reprint)</h3>${s.slice(-30).reverse().map(x=>`<div class="row" style="padding:6px 0;border-bottom:1px solid var(--bd)"><span>${esc(x.no)} · ${new Date(x.t).toLocaleTimeString('en-IN',{timeStyle:'short'})} · ${esc(x.pay)}<br><small class="mu">${x.items.map(i=>i.q+'× '+esc(i.name)).join(', ')}</small></span><span class="row" style="gap:10px"><b>${M(x.total)}</b><button onclick="reprint('${esc(x.no)}')">Reprint</button></span></div>`).join('')||'<p class="mu">Nothing to show.</p>'}</div></div>`;$('ds').onchange=e=>{dsel=e.target.value;salesR()}}
+-- 
+2.43.0
+

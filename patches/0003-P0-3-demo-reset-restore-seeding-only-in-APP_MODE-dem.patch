@@ -1,0 +1,116 @@
+From 4fd2c15134e86a1d05b50cf1c4ba03b94b54e54c Mon Sep 17 00:00:00 2001
+From: Phase0 <dev@local>
+Date: Mon, 19 Oct 2026 19:24:11 +0000
+Subject: [PATCH 3/9] P0-3: demo reset/restore/seeding only in APP_MODE=demo on
+ a database marked demo; startup never seeds production
+
+---
+ app/main.py | 64 +++++++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 52 insertions(+), 12 deletions(-)
+
+diff --git a/app/main.py b/app/main.py
+index eecf6be..4599785 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -107,21 +107,58 @@ def add_missing_samples(c):
+     return added
+ 
+ 
++def environment_guard(c, mode):
++    """A database is either 'demo' or 'production', recorded in settings('environment').
++
++    Stops a demo-mode deploy from touching a real outlet's database (and a production deploy from running on a
++    demo one). An unmarked empty database adopts the current mode; an unmarked database that already holds data is
++    only adopted by production mode (it is the existing trial data). To adopt it as demo instead, see docs/PHASE0.md.
++    """
++    row = c.execute("SELECT value FROM settings WHERE key='environment'").fetchone()
++    marker = row["value"] if row else None
++    if marker not in (None, "demo", "production"):
++        raise ConfigError(f"settings.environment has an unexpected value {marker!r}; refusing to start")
++    if marker and marker != mode:
++        raise ConfigError(f"This database is marked {marker!r} but APP_MODE={mode!r}. Refusing to start so demo and "
++                          "real data can never be mixed. Point DATABASE_URL at the right database.")
++    if marker is None:
++        has_data = c.execute("SELECT (SELECT count(*) FROM products) + (SELECT count(*) FROM sales) AS n").fetchone()["n"]
++        if mode == "demo" and has_data:
++            raise ConfigError("APP_MODE=demo refused: this database already has products/sales but is not marked as a "
++                              "demo database. If it really is a throwaway demo DB, mark it explicitly (docs/PHASE0.md).")
++        c.execute("INSERT INTO settings(key,value) VALUES('environment',%s) ON CONFLICT (key) DO NOTHING", (Json(mode),))
++        log.warning("database marked as %s (existing rows: %s)", mode, has_data)
++
++
++def demo_only(request: Request):
++    """Destructive demo tools do not exist in production: 404, not 'forbidden', so they are not even discoverable."""
++    if not CFG.is_demo:
++        raise HTTPException(404, "Not found")
++
++
++def assert_demo_db(c):
++    row = c.execute("SELECT value FROM settings WHERE key='environment'").fetchone()
++    if not row or row["value"] != "demo":  # second check, inside the transaction, right before anything destructive
++        raise HTTPException(403, "This database is not marked as a demo database")
++
++
+ @asynccontextmanager
+ async def lifespan(_):
+     global CFG
+     CFG = load_settings(os.environ)  # raises ConfigError -> process exits before serving anything
+     with db() as c:
+-        c.execute(SCHEMA)
+-        if c.execute("SELECT count(*) AS n FROM products").fetchone()["n"] == 0:
+-            seed(c)
+-    try:  # one-time top-up of extra sample products; must never stop the app from starting
+-        with db() as c:
+-            if not c.execute("SELECT 1 FROM sample_sets WHERE name='v2'").fetchone():
+-                add_missing_samples(c)
+-                c.execute("INSERT INTO sample_sets(name) VALUES('v2')")
+-    except Exception as e:
+-        print("sample top-up skipped:", e)
++        c.execute(SCHEMA)  # additive, IF NOT EXISTS only (unchanged from the prototype); never drops or rewrites data
++        environment_guard(c, CFG.mode)
++        if CFG.is_demo and c.execute("SELECT count(*) AS n FROM products").fetchone()["n"] == 0:
++            seed(c)  # demo databases only; a production database is never seeded
++    if CFG.is_demo:
++        try:  # one-time top-up of extra sample products; must never stop the app from starting
++            with db() as c:
++                if not c.execute("SELECT 1 FROM sample_sets WHERE name='v2'").fetchone():
++                    add_missing_samples(c)
++                    c.execute("INSERT INTO sample_sets(name) VALUES('v2')")
++        except Exception as e:
++            log.warning("sample top-up skipped: %s", e)
+     yield
+ 
+ 
+@@ -143,6 +180,7 @@ def require(*roles):
+     return dep
+ 
+ 
++demo_only_dep = Depends(demo_only)
+ OWNER = Depends(require("owner"))
+ ANY = Depends(require("owner", "staff"))
+ 
+@@ -397,17 +435,19 @@ def create_sale(b: SaleIn):
+         raise HTTPException(409, "Please try again")
+ 
+ 
+-@app.post("/api/restore-products", dependencies=[OWNER])
++@app.post("/api/restore-products", dependencies=[demo_only_dep, OWNER])
+ def restore_products():
+     """Additive only: adds any sample product that is missing (matched by name). Existing products, stock and sales are untouched."""
+     with db() as c:
++        assert_demo_db(c)
+         return {"added": add_missing_samples(c)}
+ 
+ 
+-@app.post("/api/reset", dependencies=[OWNER])
++@app.post("/api/reset", dependencies=[demo_only_dep, OWNER])
+ def reset():
+     """Demo-only: wipes products, sales and the stock log, then re-seeds samples. Printer settings are kept."""
+     with db() as c:
++        assert_demo_db(c)
+         c.execute("TRUNCATE sales, products, stock_log RESTART IDENTITY")
+         c.execute("ALTER SEQUENCE bill_seq RESTART WITH 1001")
+         seed(c)
+-- 
+2.43.0
+

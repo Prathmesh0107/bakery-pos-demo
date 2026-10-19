@@ -1,0 +1,207 @@
+From 46a10b0746cd7b1a78422ad36164a278b3d4833e Mon Sep 17 00:00:00 2001
+From: Phase0 <dev@local>
+Date: Mon, 19 Oct 2026 19:23:59 +0000
+Subject: [PATCH 2/9] P0-2: server-side auth on every endpoint (owner/staff
+ roles, signed session cookie, CSRF token, login throttle, no-store on /api)
+
+---
+ app/main.py | 101 +++++++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 85 insertions(+), 16 deletions(-)
+
+diff --git a/app/main.py b/app/main.py
+index 03e15ac..eecf6be 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -3,6 +3,7 @@
+ Not connected to, authorised by, or integrated with any franchise billing software.
+ """
+ import hmac
++import logging
+ import os
+ import re
+ from contextlib import asynccontextmanager
+@@ -12,13 +13,17 @@ from typing import List, Literal, Optional
+ import psycopg
+ from psycopg.rows import dict_row
+ from psycopg.types.json import Json
+-from fastapi import Depends, FastAPI, Header, HTTPException
++from fastapi import Depends, FastAPI, HTTPException, Request, Response
+ from fastapi.responses import FileResponse
+ from fastapi.staticfiles import StaticFiles
+ from pydantic import BaseModel, Field, field_validator
+ 
++from . import auth
+ from .config import ConfigError, Settings, load_settings
+ 
++log = logging.getLogger("rushpos")
++THROTTLE = auth.Throttle()
++STAFF_RECENT_BILLS = 30  # counter staff only ever receive this many recent bills (for reprint / repeat-last-bill)
+ CFG: Optional[Settings] = None  # set in lifespan from validated environment; there is no default database URL
+ STATIC = Path(__file__).resolve().parent.parent / "static"
+ CATS = ["Cakes", "Pastries", "Puffs & Savouries", "Bread & Bakery", "Cookies & Chocolates", "Candles & Birthday Accessories"]
+@@ -123,10 +128,72 @@ async def lifespan(_):
+ app = FastAPI(title="Rush Counter POS demo", lifespan=lifespan)
+ 
+ 
+-def owner(x_owner_pin: Optional[str] = Header(default=None)):
+-    """Optional owner PIN (env OWNER_PIN). Unset = open demo."""
+-    if OWNER_PIN and not hmac.compare_digest(x_owner_pin or "", OWNER_PIN):
+-        raise HTTPException(401, "Owner PIN required")
++def require(*roles):
++    """Server-side permission check used by every protected endpoint. Hiding buttons in the UI is NOT the control."""
++    def dep(request: Request) -> dict:
++        sess = auth.read_session(CFG.session_secret, request.cookies.get(auth.COOKIE))
++        if not sess:
++            raise HTTPException(401, "Please sign in")
++        if sess["role"] not in roles:
++            raise HTTPException(403, "This account is not allowed to do that")
++        if request.method not in ("GET", "HEAD", "OPTIONS"):  # CSRF: cookie alone is never enough to change data
++            if not hmac.compare_digest(request.headers.get("x-csrf-token", "").encode(), sess["csrf"].encode()):
++                raise HTTPException(403, "Security check failed - reload the page and try again")
++        return sess
++    return dep
++
++
++OWNER = Depends(require("owner"))
++ANY = Depends(require("owner", "staff"))
++
++
++class LoginIn(BaseModel):
++    role: Literal["owner", "staff"]
++    password: str = Field(min_length=1, max_length=200)
++
++
++@app.middleware("http")
++async def headers(request: Request, call_next):
++    r = await call_next(request)
++    r.headers["X-Content-Type-Options"] = "nosniff"
++    if request.url.path.startswith("/api/"):
++        r.headers["Cache-Control"] = "no-store"  # never let a browser/proxy cache sales or stock responses
++    return r
++
++
++@app.get("/api/session")
++def session(request: Request):
++    """Public and harmless: lets the page decide whether to show the login screen."""
++    sess = auth.read_session(CFG.session_secret, request.cookies.get(auth.COOKIE))
++    if not sess:
++        return {"authenticated": False, "mode": CFG.mode, "staff_login": bool(CFG.staff_hash)}
++    return {"authenticated": True, "role": sess["role"], "csrf": sess["csrf"], "mode": CFG.mode}
++
++
++@app.post("/api/login")
++def login(b: LoginIn, response: Response):
++    wait = THROTTLE.retry_after(b.role)
++    if wait:
++        raise HTTPException(429, f"Too many wrong attempts. Try again in about {wait // 60 + 1} min.",
++                            headers={"Retry-After": str(wait)})
++    ok = auth.verify_password(b.password, CFG.owner_hash if b.role == "owner" else CFG.staff_hash)
++    if not ok:
++        THROTTLE.failure(b.role)
++        log.warning("login failed role=%s", b.role)  # never log the password
++        raise HTTPException(401, "Wrong password")
++    THROTTLE.success(b.role)
++    token = auth.make_session(CFG.session_secret, b.role, CFG.session_hours)
++    response.set_cookie(auth.COOKIE, token, max_age=CFG.session_hours * 3600, httponly=True,
++                        secure=CFG.cookie_secure, samesite="strict", path="/")
++    sess = auth.read_session(CFG.session_secret, token)
++    log.info("login ok role=%s", b.role)
++    return {"authenticated": True, "role": b.role, "csrf": sess["csrf"], "mode": CFG.mode}
++
++
++@app.post("/api/logout")
++def logout(response: Response):
++    response.delete_cookie(auth.COOKIE, path="/", secure=CFG.cookie_secure, httponly=True, samesite="strict")
++    return {"ok": True}
+ 
+ 
+ class ProductIn(BaseModel):
+@@ -210,17 +277,19 @@ def healthz():
+ 
+ 
+ @app.get("/api/state")
+-def state():
++def state(sess: dict = ANY):
++    # Owners get full history (as before). Counter staff get only the latest few bills: enough to reprint, not a sales ledger.
++    n = 2000 if sess["role"] == "owner" else STAFF_RECENT_BILLS
+     with db() as c:
+         prods = c.execute("SELECT * FROM products ORDER BY id").fetchall()
+-        sales = c.execute("SELECT * FROM (SELECT * FROM sales ORDER BY id DESC LIMIT 2000) t ORDER BY id").fetchall()
++        sales = c.execute("SELECT * FROM (SELECT * FROM sales ORDER BY id DESC LIMIT %s) t ORDER BY id", (n,)).fetchall()
+         settings = get_printer(c)
+     cats = list(dict.fromkeys(p["category"] for p in prods))  # categories come from the data, in first-seen order
+     return {"products": [prod_out(p) for p in prods], "sales": [sale_out(s) for s in sales],
+-            "categories": cats, "printer": settings, "pin_required": bool(OWNER_PIN)}
++            "categories": cats, "printer": settings, "role": sess["role"], "mode": CFG.mode}
+ 
+ 
+-@app.post("/api/products", dependencies=[Depends(owner)])
++@app.post("/api/products", dependencies=[OWNER])
+ def add_product(p: ProductIn):
+     with db() as c:
+         r = c.execute("INSERT INTO products(name,category,price,stock,available,image) VALUES(%s,%s,%s,%s,%s,%s) RETURNING *",
+@@ -229,7 +298,7 @@ def add_product(p: ProductIn):
+     return prod_out(r)
+ 
+ 
+-@app.put("/api/products/{pid}", dependencies=[Depends(owner)])
++@app.put("/api/products/{pid}", dependencies=[OWNER])
+ def edit_product(pid: int, p: ProductIn):
+     with db() as c:
+         old = c.execute("SELECT * FROM products WHERE id=%s FOR UPDATE", (pid,)).fetchone()
+@@ -241,7 +310,7 @@ def edit_product(pid: int, p: ProductIn):
+     return prod_out(r)
+ 
+ 
+-@app.post("/api/products/{pid}/stock", dependencies=[Depends(owner)])
++@app.post("/api/products/{pid}/stock", dependencies=[OWNER])
+ def adjust_stock(pid: int, b: StockIn):
+     """Quick replenishment (add) or correction (set_to). Logged; never goes below zero."""
+     if (b.add is None) == (b.set_to is None):
+@@ -259,7 +328,7 @@ def adjust_stock(pid: int, b: StockIn):
+     return prod_out(r2)
+ 
+ 
+-@app.get("/api/stock-log", dependencies=[Depends(owner)])
++@app.get("/api/stock-log", dependencies=[OWNER])
+ def stock_log(limit: int = 40):
+     limit = max(1, min(limit, 200))
+     with db() as c:
+@@ -268,7 +337,7 @@ def stock_log(limit: int = 40):
+              "reason": r["reason"], "ref": r["ref"], "t": int(r["created_at"].timestamp() * 1000)} for r in rows]
+ 
+ 
+-@app.put("/api/printer", dependencies=[Depends(owner)])
++@app.put("/api/printer", dependencies=[OWNER])
+ def save_printer(b: PrinterIn):
+     with db() as c:
+         c.execute("INSERT INTO settings(key,value) VALUES('printer',%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+@@ -316,7 +385,7 @@ def _create_sale(b: SaleIn):
+         return sale_out(r)
+ 
+ 
+-@app.post("/api/sales")
++@app.post("/api/sales", dependencies=[ANY])
+ def create_sale(b: SaleIn):
+     try:
+         return _create_sale(b)
+@@ -328,14 +397,14 @@ def create_sale(b: SaleIn):
+         raise HTTPException(409, "Please try again")
+ 
+ 
+-@app.post("/api/restore-products", dependencies=[Depends(owner)])
++@app.post("/api/restore-products", dependencies=[OWNER])
+ def restore_products():
+     """Additive only: adds any sample product that is missing (matched by name). Existing products, stock and sales are untouched."""
+     with db() as c:
+         return {"added": add_missing_samples(c)}
+ 
+ 
+-@app.post("/api/reset", dependencies=[Depends(owner)])
++@app.post("/api/reset", dependencies=[OWNER])
+ def reset():
+     """Demo-only: wipes products, sales and the stock log, then re-seeds samples. Printer settings are kept."""
+     with db() as c:
+-- 
+2.43.0
+

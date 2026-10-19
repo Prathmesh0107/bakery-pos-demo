@@ -1,0 +1,224 @@
+From ecaf2c70b9a1e54c6861c4d7653d789c1536fb8e Mon Sep 17 00:00:00 2001
+From: Phase0 <dev@local>
+Date: Mon, 19 Oct 2026 19:27:44 +0000
+Subject: [PATCH 6/9] P0-7: serialise idempotency key (advisory lock), reject
+ key reuse with a different bill, by-key lookup; fix pay() shadowed 'sig' that
+ showed a false error after every successful sale; request timeout; JS tests
+
+---
+ app/main.py          | 31 +++++++++++++++-----
+ app/rules.py         | 25 ++++++++++++++++
+ static/index.html    | 15 ++++++----
+ tests/js/pay.test.js | 70 ++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 128 insertions(+), 13 deletions(-)
+ create mode 100644 app/rules.py
+ create mode 100644 tests/js/pay.test.js
+
+diff --git a/app/main.py b/app/main.py
+index fc2ea25..3c6502e 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
+ from pydantic import BaseModel, Field, field_validator
+ 
+ from . import auth
++from .rules import requested_qty, same_request
+ from .config import ConfigError, Settings, load_settings
+ 
+ log = logging.getLogger("rushpos")
+@@ -268,7 +269,7 @@ class Line(BaseModel):
+ 
+ 
+ class SaleIn(BaseModel):
+-    key: Optional[str] = Field(default=None, max_length=80)
++    key: str = Field(min_length=8, max_length=80)  # idempotency key: required, one per bill attempt
+     items: List[Line] = Field(min_length=1)
+     pay: Literal["Cash", "UPI", "Card", "Split"]  # recorded only; no real payment is processed
+     recv: Optional[int] = Field(default=None, ge=0)
+@@ -406,14 +407,18 @@ def save_printer(b: PrinterIn):
+ 
+ 
+ def _create_sale(b: SaleIn):
+-    qty = {}
+-    for i in b.items:
+-        qty[i.id] = qty.get(i.id, 0) + i.q
++    qty = requested_qty([{"id": i.id, "q": i.q} for i in b.items])
+     with db() as c:
+-        if b.key:
+-            old = c.execute("SELECT * FROM sales WHERE idem_key=%s", (b.key,)).fetchone()
+-            if old:  # same request sent twice: return the original bill, never a duplicate (stock untouched)
+-                return sale_out(old)
++        # Serialise every request that carries the same key BEFORE looking it up. Without this, a retry arriving while
++        # the first attempt is still committing would pass the lookup, then fail the stock check (the first attempt
++        # already took the stock) and show a bogus "only N in stock" error for a sale that actually succeeded.
++        c.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (b.key,))
++        old = c.execute("SELECT * FROM sales WHERE idem_key=%s", (b.key,)).fetchone()
++        if old:
++            if not same_request(old["items"], old["pay"], old.get("payments"), qty, b.pay, b.cash, b.upi):
++                raise HTTPException(409, "This bill reference was already used for a different bill. "
++                                         "Clear the bill and ring it up again.")
++            return sale_out(old)  # same request sent twice: return the original bill, never a duplicate (stock untouched)
+         rows = {r["id"]: r for r in c.execute(
+             "SELECT * FROM products WHERE id = ANY(%s) ORDER BY id FOR UPDATE", (list(qty),))}
+         items, total = [], 0
+@@ -457,6 +462,16 @@ def create_sale(b: SaleIn):
+         raise HTTPException(409, "Please try again")
+ 
+ 
++@app.get("/api/sales/by-key/{key}", dependencies=[ANY])
++def sale_by_key(key: str):
++    """Lets the counter ask 'did my earlier attempt get saved?' after a dropped connection (404 = it did not)."""
++    with db() as c:
++        old = c.execute("SELECT * FROM sales WHERE idem_key=%s", (key[:80],)).fetchone()
++    if not old:
++        raise HTTPException(404, "No sale with that reference")
++    return sale_out(old)
++
++
+ @app.post("/api/restore-products", dependencies=[demo_only_dep, OWNER])
+ def restore_products():
+     """Additive only: adds any sample product that is missing (matched by name). Existing products, stock and sales are untouched."""
+diff --git a/app/rules.py b/app/rules.py
+new file mode 100644
+index 0000000..9841699
+--- /dev/null
++++ b/app/rules.py
+@@ -0,0 +1,25 @@
++"""Pure checkout rules (no database, no web framework) so they can be unit-tested anywhere."""
++from typing import Dict, Optional
++
++
++def requested_qty(lines) -> Dict[int, int]:
++    """Merge duplicate product lines: [{id,q}, ...] -> {id: total_q}."""
++    qty: Dict[int, int] = {}
++    for i in lines:
++        qty[i["id"]] = qty.get(i["id"], 0) + i["q"]
++    return qty
++
++
++def same_request(old_items, old_pay: str, old_payments: Optional[dict], qty: Dict[int, int],
++                 pay: str, cash: Optional[int], upi: Optional[int]) -> bool:
++    """True if an already-stored sale was made from this very request (same products, quantities and payment method).
++
++    Used when an idempotency key is seen again: same bill -> return the stored sale; different bill under the same
++    key -> refuse, never silently hand back an unrelated receipt.
++    """
++    if requested_qty(old_items) != qty or old_pay != pay:
++        return False
++    if pay == "Split":
++        want = {k: v for k, v in (("Cash", cash), ("UPI", upi)) if v and v > 0}
++        return (old_payments or {}) == want
++    return True
+diff --git a/static/index.html b/static/index.html
+index 91714fd..5dc6bb5 100644
+--- a/static/index.html
++++ b/static/index.html
+@@ -117,7 +117,7 @@ const FR=document.body.dataset.f==='1',SRC=FR?'':'<!DOCTYPE html>'+document.docu
+ let S={products:[],sales:[],categories:[],printer:{shop_name:'Sweet Counter',paper_mm:58,font_px:12,show_demo_note:true,auto_print:false,footer:'',address:'',phone:'',tax_id:''},role:'',mode:'production',staffLogin:true};
+ let view='rush',cat='Popular',q='',cart=[],hist=[],busy=false,ck=null,lastSale=null,dsel='',iq='',ic='All',lowOnly=false,csrf='',slog=[];
+ const $=id=>document.getElementById(id),esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),M=n=>'₹'+Number(n).toLocaleString('en-IN'),P=id=>S.products.find(p=>p.id==id),dk=t=>new Date(t).toLocaleDateString('en-CA');
+-async function api(p,o={}){const h={'Content-Type':'application/json'};if(csrf)h['X-CSRF-Token']=csrf;const r=await fetch('/api'+p,{...o,headers:h,credentials:'same-origin'});let j=null;try{j=await r.json()}catch(e){}if(!r.ok){if(r.status==401&&p!='/login'&&p!='/session'){csrf='';loginView('Please sign in again.')}const er=new Error(j&&typeof j.detail=='string'?j.detail:'Please check the values and try again');er.status=r.status;throw er}return j}
++async function api(p,o={}){const h={'Content-Type':'application/json'};if(csrf)h['X-CSRF-Token']=csrf;const ac=new AbortController(),tm_=setTimeout(()=>ac.abort(),20000);let r;try{r=await fetch('/api'+p,{...o,headers:h,credentials:'same-origin',signal:ac.signal})}finally{clearTimeout(tm_)}let j=null;try{j=await r.json()}catch(e){}if(!r.ok){if(r.status==401&&p!='/login'&&p!='/session'){csrf='';loginView('Please sign in again.')}const er=new Error(j&&typeof j.detail=='string'?j.detail:'Please check the values and try again');er.status=r.status;throw er}return j}
+ async function load(){try{S={...S,...await api('/state')};return true}catch(e){if(e.status!=401)toast('Cannot reach server — check connection',1);return false}}
+ let tm;function toast(m,e){const t=$('tt');t.textContent=m;t.className=e?'er':'';t.style.display='block';clearTimeout(tm);tm=setTimeout(()=>t.style.display='none',2000)}
+ function modal(h){$('mb').innerHTML=h;$('md').classList.add('on')}function closeM(){$('md').classList.remove('on')}const modalOpen=()=>$('md').classList.contains('on');
+@@ -161,11 +161,16 @@ $('sc').oninput=e=>{e.target.value=e.target.value.replace(/\D/g,'');if(!touched)
+ $('su').oninput=e=>{touched=true;e.target.value=e.target.value.replace(/\D/g,'');upd()};
+ $('r1').onclick=()=>{touched=true;$('sc').value=Math.max(t-uv(),0);upd()};$('r2').onclick=()=>{touched=true;$('su').value=Math.max(t-cv(),0);upd()};
+ $('sgo').onclick=()=>{const c=cv(),u=uv();if(c+u!=t)return;closeM();pay('Split',{cash:c,upi:u})};upd();setTimeout(()=>$('sc').focus(),50)}
+-async function pay(method,extra){if(busy||!cart.length)return;const body={items:cart.map(l=>({id:l.id,q:l.q})),pay:method,...(extra||{})};const sig=JSON.stringify(body);if(!ck||ck.sig!=sig)ck={sig,k:(crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random())};
++function paid(s){s.items.forEach(i=>{const p=P(i.id);if(p)p.stock=Math.max(0,p.stock-i.q)});S.sales.push(s);cart=[];hist=[];lastSale=s;busy=false;closeBill();top_();prodR();cartR();showLast();toast('✔ Sale saved — next customer');if(S.printer.auto_print)printReceipt(s);const b0=sig();load().then(()=>{if(view=='rush'&&!busy&&sig()!=b0){fixCart();prodR();cartR();top_()}})}
++async function pay(method,extra){if(busy||!cart.length)return;const body={items:cart.map(l=>({id:l.id,q:l.q})),pay:method,...(extra||{})};const bsig=JSON.stringify(body);
+ busy=true;cartR();
+-try{const s=await api('/sales',{method:'POST',body:JSON.stringify({key:ck.k,...body})});ck=null;
+-s.items.forEach(i=>{const p=P(i.id);if(p)p.stock=Math.max(0,p.stock-i.q)});S.sales.push(s);cart=[];hist=[];lastSale=s;busy=false;closeBill();top_();prodR();cartR();showLast();toast('✔ Sale saved — next customer');if(S.printer.auto_print)printReceipt(s);const b0=sig();load().then(()=>{if(view=='rush'&&!busy&&sig()!=b0){fixCart();prodR();cartR();top_()}})}
+-catch(e){busy=false;cartR();toast(e.status?e.message:'No connection — tap again to retry (no duplicate will be made)',1);if(e.status==409){await load();fixCart();prodR();cartR()}}}
++try{
++if(ck&&ck.unsure&&ck.sig!=bsig){/* an earlier attempt got no answer and the bill has changed since: ask the server whether it was saved */
++let old=null;try{old=await api('/sales/by-key/'+encodeURIComponent(ck.k))}catch(e){if(e.status!=404)throw e}
++ck=null;if(old){S.sales.push(old);old.items.forEach(i=>{const p=P(i.id);if(p)p.stock=Math.max(0,p.stock-i.q)});lastSale=old;busy=false;cartR();prodR();top_();showLast();modal(`<p><b>Bill ${esc(old.no)} (${M(old.total)}) was already saved</b> before the connection dropped.</p><p>The bill you have open now was <b>not</b> saved. Check it before taking payment.</p><button class="pri" style="width:100%" onclick="closeM()">OK</button>`);return}}
++if(!ck||ck.sig!=bsig)ck={sig:bsig,k:(crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random()),unsure:false};
++const s=await api('/sales',{method:'POST',body:JSON.stringify({key:ck.k,...body})});ck=null;paid(s)}
++catch(e){busy=false;if(ck&&(!e.status||e.status>=500))ck.unsure=true;cartR();toast(e.status&&e.status<500?e.message:'No answer from the server — tap again to retry (a duplicate will not be made)',1);if(e.status==409){await load();fixCart();prodR();cartR()}}}
+ /* ---------- receipt / printer ---------- */
+ function rcptH(s,st,test){st=st||S.printer;const d=new Date(s.t),mm=st.paper_mm,pays=Object.entries(s.payments||{[s.pay]:s.total});
+ return`<div class="rcpt" style="width:${mm}mm;max-width:100%;font-size:${st.font_px}px"><div class="c"><b style="font-size:1.25em">${esc(st.shop_name)}</b>${st.address?'<br>'+esc(st.address):''}${st.phone?'<br>Ph: '+esc(st.phone):''}${st.tax_id?'<br>GST/Tax: '+esc(st.tax_id):''}${st.show_demo_note?'<br><i>Concept demo — not official</i>':''}</div><hr><div>Bill: ${esc(s.no)}<br>${d.toLocaleDateString('en-IN')} ${d.toLocaleTimeString('en-IN')}</div><hr><table>${s.items.map(i=>`<tr><td colspan="2">${esc(i.name)}</td></tr><tr><td>${i.q} x ${i.price}</td><td class="r">${i.q*i.price}</td></tr>`).join('')}</table><hr><div class="rw"><b>TOTAL</b><b>Rs ${s.total}</b></div><div>Paid by: ${s.pay=='Split'?'Split':esc(s.pay)}</div>${s.pay=='Split'?pays.map(p=>`<div class="rw"><span>&nbsp;${esc(p[0])}</span><span>Rs ${p[1]}</span></div>`).join(''):''}${s.recv!=null&&s.pay=='Cash'?`<div>Received ${s.recv} · Change ${s.recv-s.total}</div>`:''}<hr><div class="c">${esc(st.footer)}${test?'<br>— TEST PRINT —':''}</div></div>`}
+diff --git a/tests/js/pay.test.js b/tests/js/pay.test.js
+new file mode 100644
+index 0000000..030710e
+--- /dev/null
++++ b/tests/js/pay.test.js
+@@ -0,0 +1,70 @@
++// Executes the REAL paid()/pay() source from static/index.html against stubs.  Run:  node --test tests/js
++const test = require('node:test'), assert = require('node:assert'), fs = require('fs'), vm = require('vm'), path = require('path');
++const html = fs.readFileSync(path.join(__dirname, '../../static/index.html'), 'utf8');
++const js = html.match(/<script>([\s\S]*)<\/script>/)[1];
++const src = js.match(/function paid\(s\)\{[\s\S]*?\n(?=\/\* ---------- receipt)/)[0];
++
++function world(apiImpl, cart = [{ id: 1, q: 2 }]) {
++  const calls = [], toasts = [], modals = [];
++  const ctx = {
++    cart, busy: false, ck: null, hist: [], lastSale: null, view: 'rush', S: { sales: [], printer: { auto_print: false } },
++    P: () => ({ stock: 9 }), cartR() {}, closeBill() {}, top_() {}, prodR() {}, showLast() {}, printReceipt() {}, fixCart() {},
++    load: async () => true, sig: () => 'state', closeM() {}, esc: x => x, M: n => '₹' + n,
++    toast: (t, e) => toasts.push({ t, e: !!e }), modal: h => modals.push(h), crypto: { randomUUID: (() => { let n = 0; return () => 'key-' + (++n); })() },
++    JSON, Math, Date, encodeURIComponent,
++    api: async (p, o) => { calls.push({ p, body: o && o.body ? JSON.parse(o.body) : null }); return apiImpl(p, o, calls); },
++  };
++  vm.createContext(ctx); vm.runInContext(src, ctx);
++  return { ctx, calls, toasts, modals, pay: m => vm.runInContext(`pay(${JSON.stringify(m)})`, ctx) };
++}
++const sale = (no = 'DEMO-1001') => ({ no, total: 100, pay: 'Cash', items: [{ id: 1, q: 2, name: 'x', price: 50 }], t: Date.now() });
++const netErr = () => { throw new TypeError('Failed to fetch'); };
++const httpErr = (status, msg = 'boom') => { const e = new Error(msg); e.status = status; throw e; };
++
++test('successful sale: success message, no error toast, bill cleared', async () => {
++  const w = world(async () => sale()); await w.pay('Cash');
++  assert.deepStrictEqual(w.toasts.filter(t => t.e), []);
++  assert.ok(w.toasts.some(t => /Sale saved/.test(t.t)));
++  assert.strictEqual(JSON.stringify(w.ctx.cart), '[]'); assert.strictEqual(w.ctx.ck, null); assert.strictEqual(w.ctx.S.sales.length, 1);
++});
++
++test('no answer, retry with the SAME bill reuses the SAME idempotency key', async () => {
++  let n = 0; const w = world(async () => (++n === 1 ? netErr() : sale()));
++  await w.pay('Cash'); assert.strictEqual(w.ctx.cart.length, 1); assert.strictEqual(w.ctx.ck.unsure, true);
++  await w.pay('Cash');
++  const posts = w.calls.filter(c => c.p === '/sales'); assert.strictEqual(posts.length, 2);
++  assert.strictEqual(posts[0].body.key, posts[1].body.key); assert.strictEqual(JSON.stringify(w.ctx.cart), '[]');
++});
++
++test('no answer, bill edited, earlier attempt WAS saved: no second sale is created', async () => {
++  const w = world(async (p) => { if (p === '/sales') return netErr(); return sale('DEMO-1005'); });
++  await w.pay('Cash'); w.ctx.cart = [{ id: 1, q: 3 }];            // staff change the bill after the failure
++  await w.pay('Cash');
++  assert.strictEqual(w.calls.filter(c => c.p === '/sales').length, 1, 'must not POST a second sale');
++  assert.ok(w.calls.some(c => c.p.startsWith('/sales/by-key/key-1')));
++  assert.strictEqual(w.ctx.cart.length, 1, 'the edited open bill must be kept, not discarded');
++  assert.ok(w.modals.some(m => /already saved/.test(m)));
++});
++
++test('no answer, bill edited, earlier attempt was NOT saved (404): new key, sale goes through', async () => {
++  const w = world(async (p) => { if (p === '/sales' && !w_done.v) { w_done.v = 1; return netErr(); } if (p.startsWith('/sales/by-key')) return httpErr(404); return sale(); });
++  const w_done = { v: 0 }; await w.pay('Cash'); w.ctx.cart = [{ id: 1, q: 3 }]; await w.pay('Cash');
++  const posts = w.calls.filter(c => c.p === '/sales'); assert.strictEqual(posts.length, 2); assert.notStrictEqual(posts[0].body.key, posts[1].body.key);
++  assert.strictEqual(JSON.stringify(w.ctx.cart), '[]');
++});
++
++test('double-tap while a checkout is in flight sends exactly one request', async () => {
++  let release; const gate = new Promise(r => (release = r));
++  const w = world(async () => { await gate; return sale(); });
++  const a = w.pay('Cash'); const b = w.pay('Cash'); release(); await Promise.all([a, b]);
++  assert.strictEqual(w.calls.filter(c => c.p === '/sales').length, 1);
++});
++
++test('definite refusal (409) is not treated as unknown and keeps the bill', async () => {
++  const w = world(async () => httpErr(409, 'Only 1 of Veg Puff in stock')); await w.pay('Cash');
++  assert.ok(w.toasts.some(t => t.e && /Only 1/.test(t.t))); assert.strictEqual(w.ctx.cart.length, 1); assert.ok(!w.ctx.ck.unsure);
++});
++
++test('server error (500) is treated as "unknown outcome"', async () => {
++  const w = world(async () => httpErr(500)); await w.pay('Cash'); assert.strictEqual(w.ctx.ck.unsure, true); assert.strictEqual(w.ctx.busy, false);
++});
+-- 
+2.43.0
+
